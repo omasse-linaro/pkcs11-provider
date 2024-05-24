@@ -1,6 +1,7 @@
 /* Copyright (C) 2022 Simo Sorce <simo@redhat.com>
    SPDX-License-Identifier: Apache-2.0 */
 
+#include "pkcs11.h"
 #include "provider.h"
 #include "platform/endian.h"
 #include <string.h>
@@ -123,12 +124,31 @@ struct key_generator {
         struct {
             const CK_BYTE *ec_params;
             CK_ULONG ec_params_size;
+            CK_MECHANISM_TYPE *allowed_types;
+            CK_ULONG allowed_types_size;
         } ec;
     } data;
 
     OSSL_CALLBACK *cb_fn;
     void *cb_arg;
 };
+
+static CK_RV set_default_ec_mechanisms(struct key_generator *ctx)
+{
+    CK_MECHANISM_TYPE ec_mechs[] = { CKM_ECDSA_SHA256 };
+
+    P11PROV_debug("set allowed mechanism");
+
+    ctx->data.ec.allowed_types = OPENSSL_malloc(sizeof(ec_mechs));
+    if (ctx->data.ec.allowed_types == NULL) {
+        P11PROV_raise(ctx->provctx, CKR_HOST_MEMORY, "Allocating data");
+        return CKR_HOST_MEMORY;
+    }
+    memcpy(ctx->data.ec.allowed_types, ec_mechs, sizeof(ec_mechs));
+    ctx->data.ec.allowed_types_size = sizeof(ec_mechs);
+
+    return CKR_OK;
+}
 
 static void *p11prov_common_gen_init(void *provctx, int selection,
                                      CK_KEY_TYPE type,
@@ -171,6 +191,13 @@ static void *p11prov_common_gen_init(void *provctx, int selection,
         ctx->mechanism.mechanism = CKM_EC_KEY_PAIR_GEN;
         ctx->data.ec.ec_params = prime256v1_param;
         ctx->data.ec.ec_params_size = sizeof(prime256v1_param);
+
+        ret = set_default_ec_mechanisms(ctx);
+        if (ret != CKR_OK) {
+		P11PROV_raise(provctx, ret, "Failed to get ec params");
+		OPENSSL_free(ctx);
+		return NULL;
+        }
         break;
     case CKK_EC_EDWARDS:
         ctx->mechanism.mechanism = CKM_EC_EDWARDS_KEY_PAIR_GEN;
@@ -559,6 +586,9 @@ static void p11prov_common_gen_cleanup(void *genctx)
     if (ctx->type == CKK_RSA) {
         if (ctx->data.rsa.allowed_types_size) {
             OPENSSL_free(ctx->data.rsa.allowed_types);
+        }
+        if (ctx->data.ec.allowed_types_size) {
+            OPENSSL_free(ctx->data.ec.allowed_types);
         }
     }
 
@@ -1165,13 +1195,15 @@ static void *p11prov_ec_gen(void *genctx, OSSL_CALLBACK *cb_fn, void *cb_arg)
         { CKA_EC_PARAMS, (CK_BYTE *)ctx->data.ec.ec_params,
           ctx->data.ec.ec_params_size },
     };
-#define EC_PRIVKEY_TMPL_SIZE 5
+#define EC_PRIVKEY_TMPL_SIZE 6
     CK_ATTRIBUTE privkey_template[EC_PRIVKEY_TMPL_SIZE + COMMON_TMPL_SIZE] = {
         { CKA_TOKEN, DISCARD_CONST(&val_true), sizeof(CK_BBOOL) },
         { CKA_PRIVATE, DISCARD_CONST(&val_true), sizeof(CK_BBOOL) },
         { CKA_SENSITIVE, DISCARD_CONST(&val_true), sizeof(CK_BBOOL) },
         { CKA_SIGN, DISCARD_CONST(&val_true), sizeof(CK_BBOOL) },
         { CKA_UNWRAP, DISCARD_CONST(&val_true), sizeof(CK_BBOOL) },
+	{ CKA_ALLOWED_MECHANISMS, (CK_BYTE *)ctx->data.ec.allowed_types,
+          ctx->data.ec.allowed_types_size },
         /* TODO?
          * CKA_SUBJECT
          * CKA_COPYABLE = true ?
